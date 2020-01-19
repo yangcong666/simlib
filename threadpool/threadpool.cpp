@@ -1,169 +1,173 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <errno.h>
-#include <time.h>
-
 #include "threadpool.h"
-#include "../logs/logger.h"
 
-using namespace std;
-using namespace logger;
+pthread_mutex_t ThreadPool::lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t ThreadPool::notify = PTHREAD_COND_INITIALIZER;
+std::vector<pthread_t> ThreadPool::threads;
+std::vector<ThreadPoolTask> ThreadPool::queue;
+int ThreadPool::thread_count = 0;
+int ThreadPool::queue_size = 0;
+int ThreadPool::head = 0;
+int ThreadPool::tail = 0;
+int ThreadPool::count = 0;
+int ThreadPool::shutdown = 0;
+int ThreadPool::started = 0;
 
-
-threadpool::threadpool(int _threads)
-    :first(NULL),
-    last (NULL),
-    counter (0),
-    idle (0),
-    max_threads (_threads) ,
-    quit (0)
+int ThreadPool::threadpool_create(int _thread_count, int _queue_size)
 {
-    condition_init(ready);
+    bool err = false;
+    do
+    {
+        if(_thread_count <= 0 || _thread_count > MAX_THREADS || _queue_size <= 0 || _queue_size > MAX_QUEUE) 
+        {
+            _thread_count = 4;
+            _queue_size = 1024;
+        }
+    
+        thread_count = 0;
+        queue_size = _queue_size;
+        head = tail = count = 0;
+        shutdown = started = 0;
+
+        threads.resize(_thread_count);
+        queue.resize(_queue_size);
+    
+        /* Start worker threads */
+        for(int i = 0; i < _thread_count; ++i) 
+        {
+            if(pthread_create(&threads[i], NULL, threadpool_thread, (void*)(0)) != 0) 
+            {
+                //threadpool_destroy(pool, 0);
+                return -1;
+            }
+            ++thread_count;
+            ++started;
+        }
+    } while(false);
+    
+    if (err) 
+    {
+        //threadpool_free(pool);
+        return -1;
+    }
+    return 0;
 }
 
-//创建的线程执行
-void* threadpool::thread_routine(void *arg)
+int ThreadPool::threadpool_add(std::shared_ptr<void> args, std::function<void(std::shared_ptr<void>)> fun)
 {
-    struct timespec abstime;
-    int timeout;
-    debug()<<"thread %d is starting\n"<< (int)pthread_self();
-    threadpool *pool = (threadpool *)arg;
-    while(1)
+    int next, err = 0;
+    if(pthread_mutex_lock(&lock) != 0)
+        return THREADPOOL_LOCK_FAILURE;
+    do 
     {
-        timeout = 0;
-        //访问线程池之前需要加锁
-        condition_lock(pool->ready);
-        //空闲
-        pool->idle++;
-        //等待队列有任务到来 或者 收到线程池销毁通知
-        while(pool->first == NULL && pool->quit)
+        next = (tail + 1) % queue_size;
+        // 队列满
+        if(count == queue_size) 
         {
-            //否则线程阻塞等待
-            debug()<<"thread %d is waiting\n"<<(int)pthread_self();
-            //获取从当前时间，并加上等待时间， 设置进程的超时睡眠时间
-            clock_gettime(CLOCK_REALTIME, &abstime);  
-            abstime.tv_sec += 2;
-            
-            // 状态
-            int status;
-            status = condition_timedwait(pool->ready, &abstime);  //该函数会解锁，允许其他线程访问，当被唤醒时，加锁
-            if(status == ETIMEDOUT)
-            {
-                debug(level::Info)<<"thread %d wait timed out\n"<< (int)pthread_self();
-                timeout = 1;
-                break;
-            }
-        }
-        
-        pool->idle--;
-        if(pool->first != NULL)
-        {
-            //取出等待队列最前的任务，移除任务，并执行任务
-            task_t *t = pool->first;
-            pool->first = t->next;
-            //由于任务执行需要消耗时间，先解锁让其他线程访问线程池
-            condition_unlock(pool->ready);
-            //执行任务
-            t->run(t->arg);
-            //执行完任务释放内存
-            free(t);
-            //重新加锁
-            condition_lock(pool->ready);
-        }
-        
-        //退出线程池
-        if(pool->quit && pool->first == NULL)
-        {
-            pool->counter--;//当前工作的线程数-1
-            //若线程池中没有线程，通知等待线程（主线程）全部任务已经完成
-            if(pool->counter == 0)
-            {
-                condition_signal(pool->ready);
-            }
-            condition_unlock(pool->ready);
+            err = THREADPOOL_QUEUE_FULL;
             break;
         }
-        //超时，跳出销毁线程
-        if(timeout == 1)
+        // 已关闭
+        if(shutdown)
         {
-            pool->counter--;//当前工作的线程数-1
-            condition_unlock(pool->ready);
+            err = THREADPOOL_SHUTDOWN;
             break;
         }
+        queue[tail].fun = fun;
+        queue[tail].args = args;
+        tail = next;
+        ++count;
         
-        condition_unlock(pool->ready);
-    }
-    
-    printf("thread %d is exiting\n", (int)pthread_self());
-    return NULL;
-    
+        /* pthread_cond_broadcast */
+        if(pthread_cond_signal(&notify) != 0) 
+        {
+            err = THREADPOOL_LOCK_FAILURE;
+            break;
+        }
+    } while(false);
+
+    if(pthread_mutex_unlock(&lock) != 0)
+        err = THREADPOOL_LOCK_FAILURE;
+    return err;
 }
 
-//增加一个任务到线程池
-void threadpool::threadpool_add_task( void *(*run)(void *arg), void *arg)
+
+int ThreadPool::threadpool_destroy(ShutDownOption shutdown_option)
 {
-    //产生一个新的任务
-    task_t *newtask = (task_t *)malloc(sizeof(task_t));
-    newtask->run = run;
-    newtask->arg = arg;
-    newtask->next=NULL;//新加的任务放在队列尾端
-    
-    //线程池的状态被多个线程共享，操作前需要加锁
-    condition_lock(ready);
-    
-    if(first == NULL)//第一个任务加入
+    printf("Thread pool destroy !\n");
+    int i, err = 0;
+
+    if(pthread_mutex_lock(&lock) != 0) 
     {
-        first = newtask;
-    }        
-    else    
-    {
-        last->next = newtask;
+        return THREADPOOL_LOCK_FAILURE;
     }
-    last = newtask;  //队列尾指向新加入的线程
-    
-    //线程池中有线程空闲，唤醒
-    if(idle > 0)
+    do 
     {
-        condition_signal(ready);
-    }
-    //当前线程池中线程个数没有达到设定的最大值，创建一个新的线性
-    else if(counter < max_threads)
+        if(shutdown) {
+            err = THREADPOOL_SHUTDOWN;
+            break;
+        }
+        shutdown = shutdown_option;
+
+        if((pthread_cond_broadcast(&notify) != 0) ||
+           (pthread_mutex_unlock(&lock) != 0)) {
+            err = THREADPOOL_LOCK_FAILURE;
+            break;
+        }
+
+        for(i = 0; i < thread_count; ++i)
+        {
+            if(pthread_join(threads[i], NULL) != 0)
+            {
+                err = THREADPOOL_THREAD_FAILURE;
+            }
+        }
+    } while(false);
+
+    if(!err) 
     {
-        pthread_t tid;
-        pthread_create(&tid, NULL,thread_routine, this);
-        counter++;
+        threadpool_free();
     }
-    //结束，访问
-    condition_unlock(ready);
+    return err;
 }
 
-//线程池销毁
-void threadpool::threadpool_destroy()
+int ThreadPool::threadpool_free()
 {
-    //如果已经调用销毁，直接返回
-    if(quit)
+    if(started > 0)
+        return -1;
+    pthread_mutex_lock(&lock);
+    pthread_mutex_destroy(&lock);
+    pthread_cond_destroy(&notify);
+    return 0;
+}
+
+
+void *ThreadPool::threadpool_thread(void *args)
+{
+    while (true)
     {
-    return;
-    }
-    //加锁
-    condition_lock(ready);
-    //设置销毁标记为1
-    quit = 1;
-    //线程池中线程个数大于0
-    if(counter > 0)
-    {
-        //对于等待的线程，发送信号唤醒
-        if(idle > 0)
+        ThreadPoolTask task;
+        pthread_mutex_lock(&lock);
+        while((count == 0) && (!shutdown)) 
         {
-            condition_broadcast(ready);
+            pthread_cond_wait(&notify, &lock);
         }
-        //正在执行任务的线程，等待他们结束任务
-        while(counter)
+        if((shutdown == immediate_shutdown) ||
+           ((shutdown == graceful_shutdown) && (count == 0)))
         {
-            condition_wait(ready);
+            break;
         }
+        task.fun = queue[head].fun;
+        task.args = queue[head].args;
+        queue[head].fun = NULL;
+        queue[head].args.reset();
+        head = (head + 1) % queue_size;
+        --count;
+        pthread_mutex_unlock(&lock);
+        (task.fun)(task.args);
     }
-    condition_unlock(ready);
-    condition_destroy(ready);
+    --started;
+    pthread_mutex_unlock(&lock);
+    printf("This threadpool thread finishs!\n");
+    pthread_exit(NULL);
+    return(NULL);
 }
