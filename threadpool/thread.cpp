@@ -1,4 +1,6 @@
 #include "thread.h"
+#include "currentThread.h"
+
 #include <memory>
 #include <errno.h>
 #include <stdio.h>

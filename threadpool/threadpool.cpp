@@ -17,6 +17,7 @@ int ThreadPool::threadpool_create(int _thread_count, int _queue_size)
     bool err = false;
     do
     {
+        //如果不符合参数要求则重新赋值
         if(_thread_count <= 0 || _thread_count > MAX_THREADS || _queue_size <= 0 || _queue_size > MAX_QUEUE) 
         {
             _thread_count = 4;
@@ -163,7 +164,7 @@ void *ThreadPool::threadpool_thread(void *args)
         head = (head + 1) % queue_size;
         --count;
         pthread_mutex_unlock(&lock);
-        (task.fun)(task.args);
+        (task.fun)(task.args); //任务执行
     }
     --started;
     pthread_mutex_unlock(&lock);
