@@ -1,23 +1,46 @@
 #ifndef _CONDITION_H_
 #define _CONDITION_H_
 
+#include "mutexlock.h"
 #include <pthread.h>
+#include <errno.h>
+#include <cstdint>
+#include <time.h>
 
-//封装一个互斥量和条件变量作为状态
-typedef struct condition
+class Condition
 {
-    pthread_mutex_t pmutex;
-    pthread_cond_t pcond;
-} condition_t;
-
-//对状态的操作函数
-int condition_init(condition_t *cond);
-int condition_lock(condition_t *cond);
-int condition_unlock(condition_t *cond);
-int condition_wait(condition_t *cond);
-int condition_timedwait(condition_t *cond, const struct timespec *abstime);
-int condition_signal(condition_t* cond);
-int condition_broadcast(condition_t *cond);
-int condition_destroy(condition_t *cond);
+public:
+    explicit Condition(MutexLock &_mutex):
+        mutex(_mutex)
+    {
+        pthread_cond_init(&cond, NULL);
+    }
+    ~Condition()
+    {
+        pthread_cond_destroy(&cond);
+    }
+    void wait()
+    {
+        pthread_cond_wait(&cond, mutex.get());
+    }
+    void notify()
+    {
+        pthread_cond_signal(&cond);
+    }
+    void notifyAll()
+    {
+        pthread_cond_broadcast(&cond);
+    }
+    bool waitForSeconds(int seconds)
+    {
+        struct timespec abstime;
+        clock_gettime(CLOCK_REALTIME, &abstime);
+        abstime.tv_sec += static_cast<time_t>(seconds);
+        return ETIMEDOUT == pthread_cond_timedwait(&cond, mutex.get(), &abstime);
+    }
+private:
+    MutexLock &mutex;
+    pthread_cond_t cond;
+};
 
 #endif
